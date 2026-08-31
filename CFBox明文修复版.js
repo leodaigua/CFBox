@@ -74,6 +74,8 @@ const Defaults = {
   subMode: 'custom',    // custom sub mode by default (aggregation supported)
   subRandomCount: 16,   // random preferred count
   subPort: -1,          // fixed preferred port (-1 = random port)
+  subMaxPerSource: 20,  // each preferred API line returns at most N (0 = unlimited)
+  subMaxNodes: 100,     // total preferred nodes cap in one subscription (0 = unlimited)
   subCustomIPs: 'https://bestcf.pages.dev/random-region/HK/100.txt\nhttps://bestcf.pages.dev/random-region/TW/100.txt\nhttps://bestcf.pages.dev/random-region/JP/100.txt\nhttps://bestcf.pages.dev/random-region/SG/100.txt\nhttps://bestcf.pages.dev/random-region/US/100.txt\nbestcf.030101.xyz#Mingyu维护\ncdn.2020111.xyz\ncdns.doon.eu.org\ncf.0sm.com\ncf.877771.xyz\ncf.877774.xyz#秋名山维护\ncf.900501.xyz\ncfip.1323123.xyz\ncfip.cfcdn.vip\ncfip.xxxxxxxx.tk#OTC维护\ncloudflare.182682.xyz#WeTest.Vip维护\ncloudflare-dl.byoip.top\ncloudflare-ip.mofashi.ltd\nfn.130519.xyz\nfreeyx.cloudflare88.eu.org\nnrt.xxxxxxxx.nyc.mn\nnrtcfdns.zone.id\nsaas.sin.fan\ntencentapp.cn#ktff维护\nxn--b6gac.eu.org\n777.ai7777777.xyz',     // custompreferred（每行一个，support domain/IPv4/IPv6/sub://preferredAPI）
   subGenerator: '',     // preferred-sub generator domain
   subName: 'CFBox',     // subscription name
@@ -165,6 +167,8 @@ function EnvSnapshot(EnvVal = {}) {
     subMode: ['subMode', 'SUBMODE', 'SUB_MODE'],
     subRandomCount: ['subRandomCount', 'SUBRANDOMCOUNT', 'SUB_RANDOM_COUNT'],
     subPort: ['subPort', 'SUBPORT', 'SUB_PORT'],
+    subMaxPerSource: ['subMaxPerSource', 'SUBMAXPERSOURCE', 'SUB_MAX_PER_SOURCE'],
+    subMaxNodes: ['subMaxNodes', 'SUBMAXNODES', 'SUB_MAX_NODES'],
     subCustomIPs: ['subCustomIPs', 'SUBCUSTOMIPS', 'SUB_CUSTOM_IPS'],
     subGenerator: ['subGenerator', 'SUBGENERATOR', 'SUB_GENERATOR'],
     subName: ['subName', 'SUBNAME', 'SUB_NAME'],
@@ -2432,17 +2436,20 @@ async function FetchPrefGenData(Host) {
   return PrefIps;
 }
 
-async function QueryPrefApis(URLItems, DefaultPort = '443', TimeoutXXX2 = 3000) {
+async function QueryPrefApis(URLItems, DefaultPort = '443', TimeoutXXX2 = 3000, MaxPerSource = 0) {
   if (!URLItems?.length) return [];
   const ResultSet = new Set();
   await Promise.allSettled(URLItems.map(async (URL) => {
     const HashPos = URL.indexOf('#');
     const NoHashXXX = HashPos > -1 ? URL.substring(0, HashPos) : URL;
     const APIRemark = HashPos > -1 ? decodeURIComponent(URL.substring(HashPos + 1)) : null;
+    let SourceCount = 0;
     if (NoHashXXX.toLowerCase().startsWith('sub://')) {
       const PrefIps = await FetchPrefGenData(NoHashXXX);
       for (const IP of PrefIps) {
+        if (MaxPerSource > 0 && SourceCount >= MaxPerSource) break;
         ResultSet.add(APIRemark ? (IP.includes('#') ? `${IP} [${APIRemark}]` : `${IP}#[${APIRemark}]`) : IP);
+        SourceCount++;
       }
       return;
     }
@@ -2463,7 +2470,7 @@ async function QueryPrefApis(URLItems, DefaultPort = '443', TimeoutXXX2 = 3000) 
               if (!Row.trim()) continue;
               if (Row.includes('00000000-0000-4000-8000-000000000000') && Row.includes('example.com')) {
                 const AddrMatch = Row.match(/:\/\/[^@]+@([^?]+)/);
-                if (AddrMatch) ResultSet.add(APIRemark ? AddrMatch[1] + `#[${APIRemark}]` : AddrMatch[1]);
+                if (AddrMatch && (MaxPerSource === 0 || SourceCount < MaxPerSource)) { ResultSet.add(APIRemark ? AddrMatch[1] + `#[${APIRemark}]` : AddrMatch[1]); SourceCount++; }
               }
             }
             return;
@@ -2482,7 +2489,9 @@ async function QueryPrefApis(URLItems, DefaultPort = '443', TimeoutXXX2 = 3000) 
           HasPort = ColonPos > -1 && /^\d+$/.test(HostPart.substring(ColonPos + 1));
         }
         const ItemX14 = HasPort ? Row : `${HostPart}:${DefaultPort}${RemarkPart}`;
+        if (MaxPerSource > 0 && SourceCount >= MaxPerSource) continue;
         ResultSet.add(APIRemark ? (ItemX14.includes('#') ? `${ItemX14} [${APIRemark}]` : `${ItemX14}#[${APIRemark}]`) : ItemX14);
+        SourceCount++;
       }
     } catch {}
   }));
@@ -2512,10 +2521,14 @@ async function BuildPrefNodes(Request, Mode, Region = '') {
     return [];
   }
   const Nodes = [];
+  // 【数量限制】PerSourceCap=每个优选来源最多取几条；MaxNodes=订阅总数封顶（0 = 不限制）
+  const PerSourceCap = parseInt(GetConfigText('subMaxPerSource', 20)) || 0;
+  const MaxNodes = parseInt(GetConfigText('subMaxNodes', 100)) || 0;
   if (Mode === 'random') {
     const Count = parseInt(GetConfigText('subRandomCount', 16)) || 16;
     const FixedPort = parseInt(GetConfigText('subPort', -1));
-    return await GenRandomPrefIp(Request, Math.min(Math.max(Count, 1), 99), Number.isFinite(FixedPort) ? FixedPort : -1);
+    const RandNodes = await GenRandomPrefIp(Request, Math.min(Math.max(Count, 1), 99), Number.isFinite(FixedPort) ? FixedPort : -1);
+    return MaxNodes > 0 ? RandNodes.slice(0, MaxNodes) : RandNodes;
   }
   if (Mode === 'custom') {
     const CustomContent = GetConfigText('subCustomIPs', '');
@@ -2537,7 +2550,7 @@ async function BuildPrefNodes(Request, Mode, Region = '') {
       const XX = Row.toLowerCase();
       return XX.startsWith('sub://') || XX.startsWith('https://');
     });
-    const APINode = PrefApiItems.length > 0 ? await QueryPrefApis(PrefApiItems, '443') : [];
+    const APINode = PrefApiItems.length > 0 ? await QueryPrefApis(PrefApiItems, '443', 3000, PerSourceCap) : [];
     for (const ItemX14 of APINode) {
       const XXX6 = ItemX14.split('#');
       const Addr = XXX6[0];
@@ -2558,6 +2571,7 @@ async function BuildPrefNodes(Request, Mode, Region = '') {
       if (!PortParse.ip) continue;
       Nodes.push({ ip: PortParse.ip, port: PortParse.port, isp: Remark || PortParse.ip });
     }
+    if (MaxNodes > 0) Nodes = Nodes.slice(0, MaxNodes);
     return Nodes;
   }
   if (Mode === 'generator') {
@@ -2572,6 +2586,7 @@ async function BuildPrefNodes(Request, Mode, Region = '') {
       if (!PortParse.ip) continue;
       Nodes.push({ ip: PortParse.ip, port: PortParse.port, isp: Remark });
     }
+    if (MaxNodes > 0) Nodes = Nodes.slice(0, MaxNodes);
     return Nodes;
   }
   return Nodes;
@@ -2621,6 +2636,20 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
       FinalLinks.push(...BuildXhttpLinks(Items498, Uuid506, WorkerDomain504, EchConfig501, false, Namer502));
     }
   }
+  // 【优化】兜底公共函数：无地区→退回CF，取该地区/CF的ProxyIP兜底节点；返回是否已加兜底节点
+  async function TryProxyIpFallback() {
+    if (!CurRegion) CurRegion = 'CF';
+    const BackupAddr = await GetBackupAddr(CurRegion);
+    if (BackupAddr) {
+      FallbackAddr = BackupAddr.domain + ':' + BackupAddr.port;
+      await AddNodeSourceItems([{
+        ip: BackupAddr.domain,
+        isp: "ProxyIP-" + CurRegion
+      }]);
+      return true;
+    }
+    return false;
+  }
   if (EnableNative) {
     if (CurRegion === 'CUSTOM') {
       const NativeNodes497 = [{
@@ -2636,23 +2665,12 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
         }];
         await AddNodeSourceItems(NativeNodes496);
       } catch (Err495) {
-        if (!CurRegion) {
-          CurRegion = 'CF';
-        }
-        const BackupAddr494 = await GetBackupAddr(CurRegion);
-        if (BackupAddr494) {
-          FallbackAddr = BackupAddr494.domain + ':' + BackupAddr494.port;
-          const BackupNodes493 = [{
-            ip: BackupAddr494.domain,
-            isp: "ProxyIP-" + CurRegion
-          }];
-          await AddNodeSourceItems(BackupNodes493);
-        } else {
-          const NativeNodes = [{
+        // 【优化】兜底失败且连ProxyIP兜底也没有时，退回原生地址
+        if (!(await TryProxyIpFallback())) {
+          await AddNodeSourceItems([{
             ip: WorkerDomain504,
             isp: '原生地址'
-          }];
-          await AddNodeSourceItems(NativeNodes);
+          }]);
         }
       }
     }
@@ -2695,7 +2713,8 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
               }];
             }
           }
-          if (!PrefNodes) {
+          // 【修复】选定具体地区时不得退回全球优选列表，否则“选了地区仍是全球节点”
+          if (!PrefNodes && !IsSpecifiedRegion) {
             const Addrs490 = await GetAddrList();
             if (Addrs490.length > 0) {
               PrefNodes = Addrs490;
@@ -4086,6 +4105,9 @@ async function HandleSubPage(Request241, Uuid240 = null) {
           subCustomIPs: '自定义优选（每行一个）',
           subCustomIPsPlaceholder: '104.16.0.1:443\n子域名:端口#备注\nsub://优选API地址\nhttps://优选API地址',
           subCustomIPsHint: '支持 IP/域名:端口#备注、sub://优选API、https://优选API（自动汇聚去重）',
+          subMaxPerSource: '每来源优选上限（每条 API 行最多取几条，0=不限）',
+          subMaxNodes: '优选总数量上限（所有来源加起来最多几条，0=不限）',
+          subCountHint: '每来源限制 + 总数封顶；填 0 表示不限制',
           subGenerator: '优选订阅生成器',
           subName: '订阅名称',
           subUpdateTime: '订阅更新时间（小时）',
@@ -4297,6 +4319,9 @@ async function HandleSubPage(Request241, Uuid240 = null) {
           subCustomIPs: 'برتر سفارشی (هر خط یک مورد)',
           subCustomIPsPlaceholder: '104.16.0.1:443\nزیردامنه:پورت#یادداشت\nsub://آدرس API برتر\nhttps://آدرس API برتر',
           subCustomIPsHint: 'پشتیبانی از IP/دامنه:پورت#یادداشت، sub://API برتر، https://API برتر (تجمیع و حذف تکراری)',
+          subMaxPerSource: 'حداکثر هر منبع (حداکثر چند مورد از هر خط API، 0=نامحدود)',
+          subMaxNodes: 'حداکثر تعداد کل (حداکثر چند مورد از همه منابع، 0=نامحدود)',
+          subCountHint: 'محدودیت هر منبع + سقف کل؛ 0 یعنی نامحدود',
           subGenerator: 'تولیدکننده اشتراک برتر',
           subName: 'نام اشتراک',
           subUpdateTime: 'زمان به‌روزرسانی اشتراک (ساعت)',
@@ -4508,6 +4533,9 @@ async function HandleSubPage(Request241, Uuid240 = null) {
           subCustomIPs: 'Custom Preferred (one per line)',
           subCustomIPsPlaceholder: '104.16.0.1:443\nsubdomain:port#remark\nsub://preferred API\nhttps://preferred API',
           subCustomIPsHint: 'Supports IP/domain:port#remark, sub://preferred API, https://preferred API (auto aggregate & dedupe)',
+          subMaxPerSource: 'Per-source Preferred Cap (max per API line, 0 = unlimited)',
+          subMaxNodes: 'Total Preferred Cap (max across all sources, 0 = unlimited)',
+          subCountHint: 'Per-source limit + total cap; 0 = unlimited',
           subGenerator: 'Preferred Sub Generator',
           subName: 'Subscription Name',
           subUpdateTime: 'Subscription Update Interval (hours)',
@@ -5223,6 +5251,19 @@ async function HandleSubPage(Request241, Uuid240 = null) {
                             <option value="custom" selected>${I18n["subModeCustom"]}</option>
                         </select>
                         <small style="color:#7aa9c4;font-size:0.8rem;display:block;margin-top:5px;">${I18n["subModeHint"]}</small>
+                    </div>
+                    <div id="subCountSection" style="margin-bottom:12px;">
+                        <div style="display:flex;flex-wrap:wrap;gap:12px;">
+                            <div style="flex:1;min-width:200px;">
+                                <label style="display:block;margin-bottom:6px;color:#00f0ff;font-size:0.9rem;">${I18n["subMaxPerSource"]}</label>
+                                <input type="number" id="subMaxPerSource" min="0" value="20" style="width:100%;padding:10px;background:rgba(0,0,0,.8);border:1px solid #00f0ff;color:#00f0ff;font-family:'Courier New',monospace;font-size:13px;" />
+                            </div>
+                            <div style="flex:1;min-width:200px;">
+                                <label style="display:block;margin-bottom:6px;color:#00f0ff;font-size:0.9rem;">${I18n["subMaxNodes"]}</label>
+                                <input type="number" id="subMaxNodes" min="0" value="100" style="width:100%;padding:10px;background:rgba(0,0,0,.8);border:1px solid #00f0ff;color:#00f0ff;font-family:'Courier New',monospace;font-size:13px;" />
+                            </div>
+                        </div>
+                        <small style="color:#7aa9c4;font-size:0.8rem;display:block;margin-top:5px;">${I18n["subCountHint"]}</small>
                     </div>
                     <div id="subRandomSection" style="margin-bottom:12px;display:none;">
                         <label style="display:block;margin-bottom:6px;color:#00f0ff;font-size:0.9rem;">${I18n["subRandomCount"]}</label>
@@ -6721,6 +6762,8 @@ function ApplyConfigToUi(Config) {
   WriteFieldVal('subRandomCount', Config.subRandomCount);
   WriteFieldVal('subPort', Config.subPort);
   WriteFieldVal('subCustomIPs', Config.subCustomIPs);
+  WriteFieldVal('subMaxPerSource', Config.subMaxPerSource ?? 20);
+  WriteFieldVal('subMaxNodes', Config.subMaxNodes ?? 100);
   WriteFieldVal('subGenerator', Config.subGenerator);
   WriteFieldVal('subName', Config.subName);
   WriteFieldVal('subUpdateTime', Config.subUpdateTime);
@@ -6764,6 +6807,8 @@ function CollectUiConfig() {
     subRandomCount: ReadFieldVal('subRandomCount'),
     subPort: ReadFieldVal('subPort'),
     subCustomIPs: ReadFieldVal('subCustomIPs'),
+    subMaxPerSource: ReadFieldVal('subMaxPerSource'),
+    subMaxNodes: ReadFieldVal('subMaxNodes'),
     subGenerator: ReadFieldVal('subGenerator'),
     subName: ReadFieldVal('subName'),
     subUpdateTime: ReadFieldVal('subUpdateTime')
