@@ -2504,7 +2504,13 @@ function ParseHostPort(Addr) {
   return { ip: Addr, port: null };
 }
 
-async function BuildPrefNodes(Request, Mode) {
+async function BuildPrefNodes(Request, Mode, Region = '') {
+  // 【修复】选中具体地区时：random/generator 产出的是全球随机节点，与所选地区无关，
+  // 直接跳过，避免"选地区不生效"；统一交由该地区优选源/地区ProxyIP兜底
+  const RegionSet = Region && Region !== 'CF' && Region !== 'CUSTOM';
+  if (RegionSet && (Mode === 'random' || Mode === 'generator')) {
+    return [];
+  }
   const Nodes = [];
   if (Mode === 'random') {
     const Count = parseInt(GetConfigText('subRandomCount', 16)) || 16;
@@ -2513,7 +2519,20 @@ async function BuildPrefNodes(Request, Mode) {
   }
   if (Mode === 'custom') {
     const CustomContent = GetConfigText('subCustomIPs', '');
-    const Lines = String(CustomContent || '').split(/\r?\n/).map(Row => Row.trim()).filter(Row => Row);
+    let Lines = String(CustomContent || '').split(/\r?\n/).map(Row => Row.trim()).filter(Row => Row);
+    // 【修复】选中具体地区时：subCustomIPs 里只有按地区分区的行（如 https://bestcf.pages.dev/random-region/HK/100.txt）
+    // 才属于该地区；纯域名/无关行一律过滤掉，避免全量优选节点混入导致\"选地区不生效\"。
+    // 若该地区在配置里没有任何对应行，则此行过滤后为空，后续不会产出节点（由地区ProxyIP兜底）。
+    if (RegionSet) {
+      const RegionLower = Region.toLowerCase();
+      Lines = Lines.filter(Row => {
+        const Low = Row.toLowerCase();
+        if (Low.startsWith('https://') || Low.startsWith('http://')) {
+          return Low.includes('/random-region/' + RegionLower + '/');
+        }
+        return Low.includes(RegionLower + '.'); // 形如 xxx.HK.xxx / HK.xxx 的地区专属域名
+      });
+    }
     const PrefApiItems = Lines.filter(Row => {
       const XX = Row.toLowerCase();
       return XX.startsWith('sub://') || XX.startsWith('https://');
@@ -2564,6 +2583,9 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
   const WorkerDomain504 = Url505.hostname;
   const Target503 = Url505.searchParams.get('target') || 'base64';
   const Namer502 = MakeNamer(false);
+  // 【修复】订阅URL上的 wk 参数优先于全局配置：订阅端选了哪个地区，本次订阅就按该地区生成节点
+  const SubUrlRegion = (Url505.searchParams.get('wk') || '').trim().toUpperCase();
+  if (SubUrlRegion) CurRegion = SubUrlRegion;
 
   // if ECH enabled, use the custom value
   let EchConfig501 = null;
@@ -2572,20 +2594,23 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
     const EchDomain499 = CustomEchDomain || 'cloudflare-ech.com';
     EchConfig501 = `${EchDomain499}+${DnsVal500}`;
   }
-  async function AddNodeSourceItems(Items498) {
-    // 【修复】unified IP-version filter so ipv4/ipv6 apply to every node source
+  // 【修复】把 IPv4/IPv6 过滤逻辑抽成公共函数，确保每一路节点来源（包括下面 EnableRepoPref
+  // 自定义优选/GitHub优选这一路，此前完全绕过了这个过滤）都能吃到同一份开关设置
+  function FilterByIpVersion(Items) {
     const Ipv4Enabled = GetConfigVal('ipv4', '') === '' || GetConfigVal('ipv4', 'yes') !== 'no';
     const Ipv6Enabled = GetConfigVal('ipv6', '') === '' || GetConfigVal('ipv6', 'yes') !== 'no';
-    if (Items498 && Items498.length > 0) {
-      Items498 = Items498.filter(ItemX14 => {
-        const ipText = String(ItemX14 && ItemX14.ip || '').trim();
-        if (!ipText) return true;
-        const ColonCount = (ipText.match(/:/g) || []).length;
-        const IsXXX6 = ipText.startsWith('[') || ColonCount > 1;
-        if (IsXXX6) return Ipv6Enabled;
-        return Ipv4Enabled;
-      });
-    }
+    if (!Items || Items.length === 0) return Items;
+    return Items.filter(ItemX14 => {
+      const ipText = String(ItemX14 && ItemX14.ip || '').trim();
+      if (!ipText) return true;
+      const ColonCount = (ipText.match(/:/g) || []).length;
+      const IsXXX6 = ipText.startsWith('[') || ColonCount > 1;
+      if (IsXXX6) return Ipv6Enabled;
+      return Ipv4Enabled;
+    });
+  }
+  async function AddNodeSourceItems(Items498) {
+    Items498 = FilterByIpVersion(Items498);
     if (EnablePlain) {
       FinalLinks.push(...BuildVlessLinks(Items498, Uuid506, WorkerDomain504, EchConfig501, false, Namer502));
     }
@@ -2645,7 +2670,11 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
       await AddNodeSourceItems(CustomDomainNodes);
     }
   } else {
-    if (EnablePrefDomain) {
+    // 【修复】选择了具体地区(wk)后，只使用该地区专属节点，
+    // 不再叠加"优选域名"和"自定义优选(GitHub优选)"这类和地区无关的大批量节点，
+    // 否则不管选什么地区，订阅里都会混入这两类节点，出现"选地区不生效"的问题
+    const IsSpecifiedRegion = CurRegion && CurRegion !== 'CF' && CurRegion !== 'CUSTOM';
+    if (EnablePrefDomain && !IsSpecifiedRegion) {
       const DomainNodes = DirectDomains.map(DVal491 => ({
         ip: DVal491.domain,
         isp: DVal491.name || DVal491.domain
@@ -2654,8 +2683,6 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
     }
     if (EnablePrefIp) {
       if (!PrefAddrSource) {
-        // 【修复】when a region (wk) is set, prefer that region’s backup addresses as preferred nodes; otherwise keep the old logic
-        const IsSpecifiedRegion = CurRegion && CurRegion !== 'CF' && CurRegion !== 'CUSTOM';
         try {
           let PrefNodes = null;
           if (IsSpecifiedRegion) {
@@ -2693,9 +2720,9 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
         }
       }
     }
-    if (EnableRepoPref) {
+    if (EnableRepoPref && !IsSpecifiedRegion) {
       try {
-        const NewAddrs = await FetchNewAddrs();
+        const NewAddrs = FilterByIpVersion(await FetchNewAddrs());
         if (NewAddrs.length > 0) {
           if (EnablePlain) {
             FinalLinks.push(...BuildNewVlessLinks(NewAddrs, Uuid506, WorkerDomain504, EchConfig501, false, Namer502));
@@ -2728,7 +2755,7 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
   const SubMode = String(GetConfigText('subMode', '')).trim().toLowerCase();
   if (SubMode === 'random' || SubMode === 'custom' || SubMode === 'generator') {
     try {
-      const ModuleNodes = await BuildPrefNodes(Request507, SubMode);
+      const ModuleNodes = await BuildPrefNodes(Request507, SubMode, CurRegion);
       if (ModuleNodes.length > 0) {
         await AddNodeSourceItems(ModuleNodes);
       }
@@ -2763,7 +2790,7 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
       break;
     case "quantumult":
     case "quanx":
-    case "quanx":
+    case "quantumultx":
       SubText = GenQuanxConf(FinalLinks);
       ContentType483 = 'text/plain; charset=utf-8';
       break;
@@ -2780,7 +2807,6 @@ async function HandleSubRequest(Request507, Uuid506, Url505 = null) {
       break;
     case "singbox":
     case "sing-box":
-    case "singbox":
       SubText = GenSingboxJson(FinalLinks);
       ContentType483 = 'application/json; charset=utf-8';
       break;
@@ -3094,7 +3120,8 @@ async function HandleWsRequest(Request417) {
   let Val2408 = false;
   let Transferring = false;
   const ChunkQueue = CreateChunkQueue(UpPacketSize, UpQueueLimit, UpQueueLimit >> 8);
-  const ReqRegionMatch407 = Request417.fetcher;
+  // 【优化】这其实是请求自带的 fetcher（socket绑定），不是区域匹配开关；改名避免误解。
+  const RequestFetcher407 = Request417.fetcher;
   function ReleaseWriter() {
     try {
       RemoteConn409.writer?.releaseLock();
@@ -3147,7 +3174,7 @@ async function HandleWsRequest(Request417) {
     async write(Chunk397) {
       if (Transferring) return;
       const Data396 = ToU8(Chunk397);
-      if (IsDns) return await HandleUdp(Data396, Val2410, null, ReqRegionMatch407);
+      if (IsDns) return await HandleUdp(Data396, Val2410, null, RequestFetcher407);
       if (RemoteConn409.socket && RemoteConn409.writer) {
         if (!EnqueueChunk(Data396)) throw new Error('upload queue overflow');
         return;
@@ -3174,8 +3201,8 @@ async function HandleWsRequest(Request417) {
             }
             const RespHeader390 = new Uint8Array([Local392[0], 0]);
             const RawData389 = Data396.subarray(RawIndex);
-            if (IsDns) return HandleUdp(RawData389, Val2410, RespHeader390, ReqRegionMatch407);
-            await HandleXhttpRemote384(AddrType395, Hostname393, Port394, RawData389, Val2410, RespHeader390, RemoteConn409, ReqFallback416, RealRegion411, ReqRegionMatch414, ReqProxyCfg413, ReqRegionMatch407);
+            if (IsDns) return HandleUdp(RawData389, Val2410, RespHeader390, RequestFetcher407);
+            await HandleXhttpRemote384(AddrType395, Hostname393, Port394, RawData389, Val2410, RespHeader390, RemoteConn409, ReqFallback416, RealRegion411, ReqRegionMatch414, ReqProxyCfg413, RequestFetcher407);
             return;
           }
         }
@@ -3189,7 +3216,7 @@ async function HandleWsRequest(Request417) {
               hostname: Hostname386,
               rawClientData: RawClientData
             } = TrojanHead;
-            await HandleXhttpRemote384(AddrType388, Hostname386, Port387, RawClientData, Val2410, null, RemoteConn409, ReqFallback416, RealRegion411, ReqRegionMatch414, ReqProxyCfg413, ReqRegionMatch407);
+            await HandleXhttpRemote384(AddrType388, Hostname386, Port387, RawClientData, Val2410, null, RemoteConn409, ReqFallback416, RealRegion411, ReqRegionMatch414, ReqProxyCfg413, RequestFetcher407);
             return;
           }
         }
@@ -5647,8 +5674,9 @@ function OpenChain() {
   const Overlay = document.getElementById('chainProxyOverlay');
   if (Overlay) Overlay.style.display = 'flex';
   const Input = document.getElementById('chainProxyInput');
-  const Existing = document.getElementById('subChainProxy');
-  if (Input && Existing && Existing.value) Input.value = Existing.value;
+  // 【修复】原来读取的 #subChainProxy 元素在页面上不存在，导致重新打开弹窗时
+  // 永远看不到上次已应用的链式代理地址。改为读取实际暂存的值。
+  if (Input && window.__pendingChainProxy) Input.value = window.__pendingChainProxy;
 }
 function CloseChain() {
   const Overlay = document.getElementById('chainProxyOverlay');
@@ -5688,12 +5716,10 @@ async function VerifyChainProxy() {
 }
 function ApplyChainProxy() {
   const Input = document.getElementById('chainProxyInput');
-  const Target = document.getElementById('subChainProxy');
   if (!Input || !Input.value.trim()) return;
-  if (Target) {
-    Target.value = Input.value.trim();
-    Target.style.borderColor = '#00ffc4';
-  }
+  // 【修复】原来写入的 #subChainProxy 元素在页面上不存在，点"应用"其实什么都没发生，
+  // 提示"点保存全部生效"是假的。现在把值暂存起来，"保存全部"时会真正带上它一起提交。
+  window.__pendingChainProxy = Input.value.trim();
   ShowToast('已应用链式代理，请点击保存全部生效', 'success');
   CloseChain();
 }
@@ -5879,6 +5905,9 @@ function BuildClientLink(ClientType, ClientName) {
   var SubNameVal20200 = SubNameInput20200 ? SubNameInput20200.value.trim() : "";
   // 附加订阅名称参数，客户端导入订阅时显示对应名称
   SubUrl20191 += (SubUrl20191.includes("?") ? "&" : "?") + "name=" + encodeURIComponent(SubNameVal20200 || "CFBox");
+  // 【修复】把当前选中的地区(wk)一并写入订阅链接，让订阅端按所选地区生成对应地区的优选节点
+  var WkRegionVal20200 = ((document.getElementById("wkRegion") || {}).value || "").trim();
+  if (WkRegionVal20200) SubUrl20191 += (SubUrl20191.includes("?") ? "&" : "?") + "wk=" + encodeURIComponent(WkRegionVal20200);
   var SchemeUrl = '';
   var ShowName = ClientName || '';
   var FinalUrl = SubUrl20191;
@@ -6585,7 +6614,10 @@ async function CheckKvStatus() {
 }
 function ReadFieldVal(Id) {
   const El = document.getElementById(Id);
-  return El ? El.value : '';
+  // 【修复】区分"元素存在但内容为空"(合法的清空操作,应当保存为空)
+  // 和"当前页面上根本没有这个输入框"(不该把它当成用户主动清空,否则会在保存时
+  // 把 yx/yxURL/socksConfig 等已保存的配置误删)。返回 null 作为"跳过此字段"的标记。
+  return El ? El.value : null;
 }
 
 function WriteFieldVal(Id, Val = '') {
@@ -6676,6 +6708,9 @@ function ApplyConfigToUi(Config) {
   WriteFieldVal('yxURL', Config.yxURL);
   WriteFieldVal('socksConfig', Config.s);
   WriteFieldVal('subChainProxy', Config.s);
+  // 【修复】同步已保存的链式代理配置到暂存变量，这样重新打开"链式代理"弹窗时
+  // 能看到当前生效的值，而不是每次都是空的
+  if (Config.s) window.__pendingChainProxy = Config.s;
   WriteFieldVal('customHomepage', Config.homepage);
   WriteFieldVal('apiEnabled', Config.ae);
   WriteFieldVal('regionMatching', Config.rm);
@@ -6759,10 +6794,20 @@ function CollectUiConfig() {
     Config.subGenerator = '';
   }
   // ⚡ 优选工具：订阅接口 / 链式代理 与配置管理同步（随保存全部统一保存）
-  const UtilSubApi = ReadFieldVal('subConverterUrl');
-  const UtilXXProxy = ReadFieldVal('subChainProxy');
-  if (UtilSubApi) { Config.scu = UtilSubApi; WriteFieldVal('scu', UtilSubApi); }
-  if (UtilXXProxy) { Config.s = UtilXXProxy; WriteFieldVal('socksConfig', UtilXXProxy); }
+  // 【修复】subConverterUrl / subChainProxy 这两个输入框在当前面板里并不存在，
+  // 之前直接从 DOM 读取会永远拿到 null，现在改为读取"链式代理"弹窗应用后暂存的值
+  if (window.__pendingSubConverterUrl) { Config.scu = window.__pendingSubConverterUrl; }
+  if (window.__pendingChainProxy) { Config.s = window.__pendingChainProxy; }
+
+  // 【修复】yx / yxURL / socksConfig 这三个字段在当前面板 HTML 里没有对应的输入框，
+  // ReadFieldVal 会返回 null（代表"这个字段在当前页面上不存在"，而不是"用户主动清空"）。
+  // 之前会把 null 一起当作空字符串发给服务端，导致服务端把已保存的 yx/yxURL/s 直接删掉——
+  // 也就是明明什么都没改，点一下"保存全部"就把自定义优选IP/代理配置清空了。
+  // 这里在返回前统一把值为 null 的字段剔除，保存请求里根本不带这个 key，
+  // 服务端就不会碰它，原有配置保持不变。
+  Object.keys(Config).forEach(K => {
+    if (Config[K] === null) delete Config[K];
+  });
   return Config;
 }
 
